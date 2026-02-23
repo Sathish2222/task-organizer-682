@@ -1,6 +1,7 @@
 import os
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional, Sequence
+from urllib.parse import urlparse, urlunparse
 
 import psycopg
 from psycopg.rows import dict_row
@@ -16,26 +17,66 @@ def _required_env(name: str) -> str:
     return value
 
 
+def _looks_like_url(value: str) -> bool:
+    """Return True if value looks like a postgres URL (has a scheme)."""
+    try:
+        return bool(urlparse(value).scheme)
+    except Exception:
+        return False
+
+
 # PUBLIC_INTERFACE
 def get_db_dsn() -> str:
-    """Builds a Postgres DSN from environment variables.
+    """Build a Postgres DSN from environment variables.
 
-    Uses the database container env var names:
+    This backend runs against the `task_manager_database` container and therefore
+    expects the standard env var names:
       POSTGRES_URL, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, POSTGRES_PORT
+
+    IMPORTANT:
+    - Some environments provide `POSTGRES_URL` as a *host* (e.g. `localhost`).
+    - Other environments provide `POSTGRES_URL` as a *full URL*
+      (e.g. `postgresql://localhost:5000/myapp`).
+
+    This function supports both shapes:
+    - If POSTGRES_URL is a full URL, we will use it and inject credentials if missing.
+    - If POSTGRES_URL is host-like, we build a full DSN explicitly.
 
     Returns:
         A connection string suitable for psycopg, e.g.:
-        postgresql://user:pass@host:port/db
+        `postgresql://user:pass@host:port/db`
     """
-    host = _required_env("POSTGRES_URL")
+    postgres_url = _required_env("POSTGRES_URL").strip()
     user = _required_env("POSTGRES_USER")
     password = _required_env("POSTGRES_PASSWORD")
     db = _required_env("POSTGRES_DB")
     port = _required_env("POSTGRES_PORT")
 
-    # Keep it explicit (and avoid assuming POSTGRES_URL already contains scheme).
-    # If POSTGRES_URL includes scheme already, psycopg will reject this; expected
-    # from platform is host-like value. If that changes, update here.
+    if _looks_like_url(postgres_url):
+        parsed = urlparse(postgres_url)
+        scheme = parsed.scheme or "postgresql"
+
+        # If the provided URL already includes creds, keep them; otherwise inject.
+        netloc = parsed.netloc
+        if "@" not in netloc:
+            netloc = f"{user}:{password}@{netloc}"
+
+        # If path is empty (or `/`), ensure we set DB name from POSTGRES_DB.
+        path = parsed.path or ""
+        if path in ("", "/"):
+            path = f"/{db}"
+
+        # If the URL has no port and POSTGRES_PORT exists, inject it.
+        # urlparse puts host:port in netloc, so we do a light touch here.
+        if ":" not in netloc.split("@")[-1] and port:
+            host_part = netloc.split("@")[-1]
+            prefix = netloc[: -len(host_part)]
+            netloc = f"{prefix}{host_part}:{port}"
+
+        return urlunparse((scheme, netloc, path, "", "", ""))
+
+    # Host-like POSTGRES_URL: build DSN explicitly.
+    host = postgres_url
     return f"postgresql://{user}:{password}@{host}:{port}/{db}"
 
 
